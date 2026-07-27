@@ -25,6 +25,7 @@ jobs:
          MIN_SURFACE: ${{ vars.MIN_SURFACE }}
          MIN_ROOMS: ${{ vars.MIN_ROOMS }}
          CITIES: ${{ vars.CITIES }}
+         SEARCH_URL: ${{ vars.SEARCH_URL }}
        run: python scraper.py
      - name: Sauvegarder l'état (annonces déjà vues)
        run: |
