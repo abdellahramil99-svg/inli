@@ -10,10 +10,7 @@ Config via variables d'environnement (voir README.md) :
                                             recherche filtrée (région, prix,
                                             surface...) copiée depuis inli.fr.
                                             Si absent, utilise la liste générale.
- MAX_RENT, MIN_SURFACE, MIN_ROOMS       -> optionnels (filtres supplémentaires,
-                                            utile en plus de SEARCH_URL pour
-                                            filtrer sur des critères que l'URL
-                                            ne gère pas, ex: nb de pièces précis)
+ MAX_RENT, MIN_SURFACE, MIN_ROOMS       -> optionnels (filtres supplémentaires)
  CITIES                                 -> optionnel, liste séparée par des virgules
  MAX_PAGES                              -> optionnel, sécurité (def. 30)
 """
@@ -35,9 +32,9 @@ HEADERS = {
    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
 # ---------- Config (lue depuis l'environnement) ----------
-MAX_RENT = os.environ.get("MAX_RENT")  # ex: "1200"
-MIN_SURFACE = os.environ.get("MIN_SURFACE")  # ex: "30"
-MIN_ROOMS = os.environ.get("MIN_ROOMS")  # ex: "2" (Studio = 1)
+MAX_RENT = os.environ.get("MAX_RENT")
+MIN_SURFACE = os.environ.get("MIN_SURFACE")
+MIN_ROOMS = os.environ.get("MIN_ROOMS")
 CITIES = [c.strip().lower() for c in os.environ.get("CITIES", "").split(",") if c.strip()]
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "30"))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -111,14 +108,32 @@ def matches_criteria(listing: dict) -> bool:
            return False
    return True
 
-def load_seen_refs() -> set:
-   if STATE_FILE.exists():
-       return set(json.loads(STATE_FILE.read_text()))
-   return set()
+def load_state():
+   """Retourne (seen_refs: set, initialized: bool).
+   Le fichier est un objet {"initialized": bool, "seen_refs": [...]}.
+   Un ancien format (juste une liste) est aussi accepté, pour compatibilité,
+   et traité comme déjà initialisé.
+   IMPORTANT: 'initialized' est stocké séparément du contenu de seen_refs,
+   pour ne jamais confondre "0 annonce dispo en ce moment" (normal, filtre
+   restrictif) avec "premier lancement jamais fait" (qui, lui, doit couper
+   les notifications une seule fois, au tout début).
+   """
+   if not STATE_FILE.exists():
+       return set(), False
+   data = json.loads(STATE_FILE.read_text())
+   if isinstance(data, list):
+       return set(data), True
+   return set(data.get("seen_refs", [])), bool(data.get("initialized", False))
 
-def save_seen_refs(refs: set):
+def save_state(refs: set, initialized: bool = True):
    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-   STATE_FILE.write_text(json.dumps(sorted(refs), ensure_ascii=False, indent=2))
+   STATE_FILE.write_text(
+       json.dumps(
+           {"initialized": initialized, "seen_refs": sorted(refs)},
+           ensure_ascii=False,
+           indent=2,
+       )
+   )
 
 def send_telegram(message: str):
    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -138,8 +153,8 @@ def send_telegram(message: str):
        print("Erreur envoi Telegram:", resp.status_code, resp.text, file=sys.stderr)
 
 def main():
-   seen_refs = load_seen_refs()
-   is_first_run = len(seen_refs) == 0
+   seen_refs, initialized = load_state()
+   is_first_run = not initialized
    all_listings = []
    for page in range(1, MAX_PAGES + 1):
        try:
@@ -149,18 +164,17 @@ def main():
            break
        listings = parse_listings(html)
        if not listings:
-           break  # plus de résultats, on arrête la pagination
+           break
        all_listings.extend(listings)
-       time.sleep(1)  # politesse envers le serveur
+       time.sleep(1)
    current_refs = {l["ref"] for l in all_listings}
    new_refs = current_refs - seen_refs
    if is_first_run:
-       # Premier lancement : on enregistre l'état actuel sans notifier
-       # (sinon tu reçois 600+ messages d'un coup)
-       print(f"Premier lancement : {len(current_refs)} annonces enregistrées comme référence.")
+       print(f"Premier lancement : {len(current_refs)} annonce(s) enregistrée(s) comme référence, aucune notif envoyée.")
    else:
        new_listings = [l for l in all_listings if l["ref"] in new_refs]
        matching = [l for l in new_listings if matches_criteria(l)]
+       print(f"{len(current_refs)} annonce(s) actuellement en ligne sous ce filtre.")
        print(f"{len(new_listings)} nouvelle(s) annonce(s) au total, {len(matching)} correspondant à tes critères.")
        for listing in matching:
            msg = (
@@ -170,9 +184,9 @@ def main():
                f"{listing['url']}"
            )
            send_telegram(msg)
-   # On garde uniquement les refs encore visibles sur le site + les nouvelles
-   # (évite que le fichier grossisse indéfiniment avec des annonces louées)
-   save_seen_refs(current_refs)
+   # 'initialized' passe (ou reste) à True après ce run, quel que soit le
+   # nombre d'annonces actuellement en ligne (même 0).
+   save_state(current_refs, initialized=True)
 
 if __name__ == "__main__":
    main()
