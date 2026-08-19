@@ -19,8 +19,10 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 import requests
 from bs4 import BeautifulSoup
 BASE_URL = "https://www.inli.fr"
@@ -31,6 +33,9 @@ HEADERS = {
    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 }
+PARIS_TZ = ZoneInfo("Europe/Paris")
+HEARTBEAT_START_HOUR = int(os.environ.get("HEARTBEAT_START_HOUR", "9"))
+HEARTBEAT_END_HOUR = int(os.environ.get("HEARTBEAT_END_HOUR", "20"))
 # ---------- Config (lue depuis l'environnement) ----------
 MAX_RENT = os.environ.get("MAX_RENT")
 MIN_SURFACE = os.environ.get("MIN_SURFACE")
@@ -109,27 +114,35 @@ def matches_criteria(listing: dict) -> bool:
    return True
 
 def load_state():
-   """Retourne (seen_refs: set, initialized: bool).
-   Le fichier est un objet {"initialized": bool, "seen_refs": [...]}.
+   """Retourne (seen_refs: set, initialized: bool, last_heartbeat: str|None).
+   Le fichier est un objet {"initialized": bool, "seen_refs": [...], "last_heartbeat": "..."}.
    Un ancien format (juste une liste) est aussi accepté, pour compatibilité,
-   et traité comme déjà initialisé.
+   et traité comme déjà initialisé, sans heartbeat enregistré.
    IMPORTANT: 'initialized' est stocké séparément du contenu de seen_refs,
    pour ne jamais confondre "0 annonce dispo en ce moment" (normal, filtre
    restrictif) avec "premier lancement jamais fait" (qui, lui, doit couper
    les notifications une seule fois, au tout début).
    """
    if not STATE_FILE.exists():
-       return set(), False
+       return set(), False, None
    data = json.loads(STATE_FILE.read_text())
    if isinstance(data, list):
-       return set(data), True
-   return set(data.get("seen_refs", [])), bool(data.get("initialized", False))
+       return set(data), True, None
+   return (
+       set(data.get("seen_refs", [])),
+       bool(data.get("initialized", False)),
+       data.get("last_heartbeat"),
+   )
 
-def save_state(refs: set, initialized: bool = True):
+def save_state(refs: set, initialized: bool = True, last_heartbeat: str = None):
    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
    STATE_FILE.write_text(
        json.dumps(
-           {"initialized": initialized, "seen_refs": sorted(refs)},
+           {
+               "initialized": initialized,
+               "seen_refs": sorted(refs),
+               "last_heartbeat": last_heartbeat,
+           },
            ensure_ascii=False,
            indent=2,
        )
@@ -153,7 +166,7 @@ def send_telegram(message: str):
        print("Erreur envoi Telegram:", resp.status_code, resp.text, file=sys.stderr)
 
 def main():
-   seen_refs, initialized = load_state()
+   seen_refs, initialized, last_heartbeat = load_state()
    is_first_run = not initialized
    all_listings = []
    for page in range(1, MAX_PAGES + 1):
@@ -184,9 +197,24 @@ def main():
                f"{listing['url']}"
            )
            send_telegram(msg)
+   # ---------- Heartbeat horaire (9h-20h, heure de Paris) ----------
+   now_paris = datetime.now(PARIS_TZ)
+   heartbeat_key = now_paris.strftime("%Y-%m-%d-%H")
+   should_send_heartbeat = (
+       not is_first_run
+       and HEARTBEAT_START_HOUR <= now_paris.hour <= HEARTBEAT_END_HOUR
+       and heartbeat_key != last_heartbeat
+   )
+   if should_send_heartbeat:
+       send_telegram(
+           f"✅ Système actif — {now_paris.strftime('%H:%M')} — "
+           f"{len(current_refs)} annonce(s) en ligne actuellement sous ton filtre."
+       )
+       last_heartbeat = heartbeat_key
+       print(f"Heartbeat envoyé pour {heartbeat_key}.")
    # 'initialized' passe (ou reste) à True après ce run, quel que soit le
    # nombre d'annonces actuellement en ligne (même 0).
-   save_state(current_refs, initialized=True)
+   save_state(current_refs, initialized=True, last_heartbeat=last_heartbeat)
 
 if __name__ == "__main__":
    main()
