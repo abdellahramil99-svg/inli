@@ -3,16 +3,17 @@
 Surveillance des nouvelles annonces in'li (Action Logement).
 Scrape la liste des annonces de location, filtre selon tes critères,
 compare aux annonces déjà vues, et envoie une notif Telegram pour
-chaque nouvelle annonce correspondant à tes critères.
+chaque nouvelle annonce correspondant à tes critères. Envoie aussi un
+heartbeat une fois par heure (9h-20h, heure de Paris) pour confirmer
+que le système est bien actif.
 Config via variables d'environnement (voir README.md) :
  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   -> obligatoires
- SEARCH_URL                             -> optionnel : colle ici une URL de
-                                            recherche filtrée (région, prix,
-                                            surface...) copiée depuis inli.fr.
-                                            Si absent, utilise la liste générale.
+ SEARCH_URL                             -> optionnel : URL de recherche
+                                            filtrée copiée depuis inli.fr.
  MAX_RENT, MIN_SURFACE, MIN_ROOMS       -> optionnels (filtres supplémentaires)
  CITIES                                 -> optionnel, liste séparée par des virgules
  MAX_PAGES                              -> optionnel, sécurité (def. 30)
+ HEARTBEAT_START_HOUR, HEARTBEAT_END_HOUR -> optionnels (def. 9 et 20)
 """
 import json
 import os
@@ -44,6 +45,12 @@ CITIES = [c.strip().lower() for c in os.environ.get("CITIES", "").split(",") if 
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "30"))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+# Lien d'une annonce individuelle sur inli.fr, ex:
+#   /location-appartement-paris-19-75019/x3F-4254-0196L
+#   /location-studio-clichy-92110/AB1-2345-6789Z
+# (le tiret juste après "location" distingue ces liens de la page de liste
+#  elle-même, qui est "/locations/offres/" avec un "s").
+LISTING_HREF_RE = re.compile(r"^/location-[a-z0-9\-]+/[A-Za-z0-9\-]+/?$")
 
 def build_page_url(page_num: int) -> str:
    if page_num == 1:
@@ -63,17 +70,26 @@ def parse_listings(html: str):
    soup = BeautifulSoup(html, "html.parser")
    seen_refs_on_page = set()
    listings = []
-   for a in soup.find_all("a", href=re.compile(r"/locations/offre/")):
+   for a in soup.find_all("a", href=True):
        href = a.get("href", "")
-       ref = href.rstrip("/").split("/")[-1]
+       path = href
+       if path.startswith(BASE_URL):
+           path = path[len(BASE_URL):]
+       if not LISTING_HREF_RE.match(path):
+           continue
+       ref = path.rstrip("/").split("/")[-1]
        if not ref or ref in seen_refs_on_page:
            continue
        seen_refs_on_page.add(ref)
        text = a.get_text(" ", strip=True)
-       price_match = re.search(r"([\d\s]{3,})\s*€", text)
+       price_match = re.search(r"([\d\s]{2,})\s*€", text)
        surface_match = re.search(r"([\d.,]+)\s*m²", text)
-       rooms_match = re.search(r"(Studio|\d+)\s*pi[eè]ces?", text, re.IGNORECASE)
+       rooms_match = re.search(r"\bStudio\b|(\d+)\s*pi[eè]ces?", text, re.IGNORECASE)
        city_match = re.match(r"^([A-ZÀ-Ü' \-]{2,})", text)
+       if rooms_match:
+           rooms_val = "Studio" if rooms_match.group(0).strip().lower() == "studio" else rooms_match.group(1)
+       else:
+           rooms_val = None
        listings.append(
            {
                "ref": ref,
@@ -81,7 +97,7 @@ def parse_listings(html: str):
                "text": text,
                "price": price_match.group(1).replace(" ", "") if price_match else None,
                "surface": surface_match.group(1) if surface_match else None,
-               "rooms": rooms_match.group(1) if rooms_match else None,
+               "rooms": rooms_val,
                "city": city_match.group(1).strip().title() if city_match else None,
            }
        )
@@ -114,15 +130,7 @@ def matches_criteria(listing: dict) -> bool:
    return True
 
 def load_state():
-   """Retourne (seen_refs: set, initialized: bool, last_heartbeat: str|None).
-   Le fichier est un objet {"initialized": bool, "seen_refs": [...], "last_heartbeat": "..."}.
-   Un ancien format (juste une liste) est aussi accepté, pour compatibilité,
-   et traité comme déjà initialisé, sans heartbeat enregistré.
-   IMPORTANT: 'initialized' est stocké séparément du contenu de seen_refs,
-   pour ne jamais confondre "0 annonce dispo en ce moment" (normal, filtre
-   restrictif) avec "premier lancement jamais fait" (qui, lui, doit couper
-   les notifications une seule fois, au tout début).
-   """
+   """Retourne (seen_refs: set, initialized: bool, last_heartbeat: str|None)."""
    if not STATE_FILE.exists():
        return set(), False, None
    data = json.loads(STATE_FILE.read_text())
@@ -212,8 +220,6 @@ def main():
        )
        last_heartbeat = heartbeat_key
        print(f"Heartbeat envoyé pour {heartbeat_key}.")
-   # 'initialized' passe (ou reste) à True après ce run, quel que soit le
-   # nombre d'annonces actuellement en ligne (même 0).
    save_state(current_refs, initialized=True, last_heartbeat=last_heartbeat)
 
 if __name__ == "__main__":
