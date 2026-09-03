@@ -1,226 +1,452 @@
 #!/usr/bin/env python3
+
 """
+
 Surveillance des nouvelles annonces in'li (Action Logement).
+
 Scrape la liste des annonces de location, filtre selon tes critères,
+
 compare aux annonces déjà vues, et envoie une notif Telegram pour
+
 chaque nouvelle annonce correspondant à tes critères. Envoie aussi un
+
 heartbeat une fois par heure (9h-20h, heure de Paris) pour confirmer
+
 que le système est bien actif.
+
 Config via variables d'environnement (voir README.md) :
- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   -> obligatoires
- SEARCH_URL                             -> optionnel : URL de recherche
-                                            filtrée copiée depuis inli.fr.
- MAX_RENT, MIN_SURFACE, MIN_ROOMS       -> optionnels (filtres supplémentaires)
- CITIES                                 -> optionnel, liste séparée par des virgules
- MAX_PAGES                              -> optionnel, sécurité (def. 30)
- HEARTBEAT_START_HOUR, HEARTBEAT_END_HOUR -> optionnels (def. 9 et 20)
+
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID   -> obligatoires
+
+  SEARCH_URL                             -> optionnel : URL de recherche
+
+                                             filtrée copiée depuis inli.fr.
+
+  MAX_RENT, MIN_SURFACE, MIN_ROOMS       -> optionnels (filtres supplémentaires)
+
+  CITIES                                 -> optionnel, liste séparée par des virgules
+
+  MAX_PAGES                              -> optionnel, sécurité (def. 30)
+
+  HEARTBEAT_START_HOUR, HEARTBEAT_END_HOUR -> optionnels (def. 9 et 20)
+
 """
+
 import json
+
 import os
+
 import re
+
 import sys
+
 import time
+
 from datetime import datetime
+
 from pathlib import Path
+
 from urllib.parse import urlsplit, urlunsplit
+
 from zoneinfo import ZoneInfo
+
 import requests
+
 from bs4 import BeautifulSoup
+
 BASE_URL = "https://www.inli.fr"
+
 DEFAULT_LIST_URL = "https://www.inli.fr/locations/offres/"
+
 SEARCH_URL = os.environ.get("SEARCH_URL", DEFAULT_LIST_URL).strip()
+
 STATE_FILE = Path(__file__).parent / "state" / "seen_refs.json"
+
 HEADERS = {
-   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
 }
+
 PARIS_TZ = ZoneInfo("Europe/Paris")
+
 HEARTBEAT_START_HOUR = int(os.environ.get("HEARTBEAT_START_HOUR", "9"))
+
 HEARTBEAT_END_HOUR = int(os.environ.get("HEARTBEAT_END_HOUR", "20"))
+
 # ---------- Config (lue depuis l'environnement) ----------
+
 MAX_RENT = os.environ.get("MAX_RENT")
+
 MIN_SURFACE = os.environ.get("MIN_SURFACE")
+
 MIN_ROOMS = os.environ.get("MIN_ROOMS")
+
 CITIES = [c.strip().lower() for c in os.environ.get("CITIES", "").split(",") if c.strip()]
+
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "30"))
+
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-# Lien d'une annonce individuelle sur inli.fr, ex:
-#   /location-appartement-paris-19-75019/x3F-4254-0196L
-#   /location-studio-clichy-92110/AB1-2345-6789Z
-# (le tiret juste après "location" distingue ces liens de la page de liste
-#  elle-même, qui est "/locations/offres/" avec un "s").
-LISTING_HREF_RE = re.compile(r"^/location-[a-z0-9\-]+/[A-Za-z0-9\-]+/?$")
+
+# in'li utilise DEUX formats d'URL différents pour ses annonces selon le
+
+# contexte (page de résultats vs page individuelle) :
+
+#   ancien format : /locations/offre/thiais/PRV-332878
+
+#   nouveau format : /location-appartement-paris-19-75019/x3F-4254-0196L
+
+# On accepte les deux, pour ne plus dépendre d'un seul format fragile qui
+
+# peut casser silencieusement si in'li n'en affiche qu'un des deux à un
+
+# moment donné.
+
+LISTING_HREF_RE = re.compile(
+
+    r"^/locations/offre/[a-z0-9\-]+/[A-Za-z0-9\-]+/?$"
+
+    r"|^/location-[a-z0-9\-]+/[A-Za-z0-9\-]+/?$"
+
+)
+
 
 def build_page_url(page_num: int) -> str:
-   if page_num == 1:
-       return SEARCH_URL
-   parts = urlsplit(SEARCH_URL)
-   separator = "&" if parts.query else "?"
-   new_query = f"{parts.query}{separator}page={page_num}" if parts.query else f"page={page_num}"
-   return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+    if page_num == 1:
+
+        return SEARCH_URL
+
+    parts = urlsplit(SEARCH_URL)
+
+    separator = "&" if parts.query else "?"
+
+    new_query = f"{parts.query}{separator}page={page_num}" if parts.query else f"page={page_num}"
+
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
 
 def fetch_page(page_num: int) -> str:
-   url = build_page_url(page_num)
-   resp = requests.get(url, headers=HEADERS, timeout=20)
-   resp.raise_for_status()
-   return resp.text
+
+    url = build_page_url(page_num)
+
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+
+    resp.raise_for_status()
+
+    return resp.text
+
 
 def parse_listings(html: str):
-   soup = BeautifulSoup(html, "html.parser")
-   seen_refs_on_page = set()
-   listings = []
-   for a in soup.find_all("a", href=True):
-       href = a.get("href", "")
-       path = href
-       if path.startswith(BASE_URL):
-           path = path[len(BASE_URL):]
-       if not LISTING_HREF_RE.match(path):
-           continue
-       ref = path.rstrip("/").split("/")[-1]
-       if not ref or ref in seen_refs_on_page:
-           continue
-       seen_refs_on_page.add(ref)
-       text = a.get_text(" ", strip=True)
-       price_match = re.search(r"([\d\s]{2,})\s*€", text)
-       surface_match = re.search(r"([\d.,]+)\s*m²", text)
-       rooms_match = re.search(r"\bStudio\b|(\d+)\s*pi[eè]ces?", text, re.IGNORECASE)
-       city_match = re.match(r"^([A-ZÀ-Ü' \-]{2,})", text)
-       if rooms_match:
-           rooms_val = "Studio" if rooms_match.group(0).strip().lower() == "studio" else rooms_match.group(1)
-       else:
-           rooms_val = None
-       listings.append(
-           {
-               "ref": ref,
-               "url": href if href.startswith("http") else BASE_URL + href,
-               "text": text,
-               "price": price_match.group(1).replace(" ", "") if price_match else None,
-               "surface": surface_match.group(1) if surface_match else None,
-               "rooms": rooms_val,
-               "city": city_match.group(1).strip().title() if city_match else None,
-           }
-       )
-   return listings
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    seen_refs_on_page = set()
+
+    listings = []
+
+    for a in soup.find_all("a", href=True):
+
+        href = a.get("href", "")
+
+        path = href
+
+        if path.startswith(BASE_URL):
+
+            path = path[len(BASE_URL):]
+
+        if not LISTING_HREF_RE.match(path):
+
+            continue
+
+        ref = path.rstrip("/").split("/")[-1]
+
+        if not ref or ref in seen_refs_on_page:
+
+            continue
+
+        seen_refs_on_page.add(ref)
+
+        text = a.get_text(" ", strip=True)
+
+        price_match = re.search(r"([\d\s]{2,})\s*€", text)
+
+        surface_match = re.search(r"([\d.,]+)\s*m²", text)
+
+        rooms_match = re.search(r"\bStudio\b|(\d+)\s*pi[eè]ces?", text, re.IGNORECASE)
+
+        city_match = re.match(r"^([A-ZÀ-Ü' \-]{2,})", text)
+
+        if rooms_match:
+
+            rooms_val = "Studio" if rooms_match.group(0).strip().lower() == "studio" else rooms_match.group(1)
+
+        else:
+
+            rooms_val = None
+
+        listings.append(
+
+            {
+
+                "ref": ref,
+
+                "url": href if href.startswith("http") else BASE_URL + href,
+
+                "text": text,
+
+                "price": price_match.group(1).replace(" ", "") if price_match else None,
+
+                "surface": surface_match.group(1) if surface_match else None,
+
+                "rooms": rooms_val,
+
+                "city": city_match.group(1).strip().title() if city_match else None,
+
+            }
+
+        )
+
+    return listings
+
 
 def matches_criteria(listing: dict) -> bool:
-   if MAX_RENT and listing["price"]:
-       try:
-           if float(listing["price"]) > float(MAX_RENT):
-               return False
-       except ValueError:
-           pass
-   if MIN_SURFACE and listing["surface"]:
-       try:
-           surf = float(listing["surface"].replace(",", "."))
-           if surf < float(MIN_SURFACE):
-               return False
-       except ValueError:
-           pass
-   if MIN_ROOMS and listing["rooms"]:
-       rooms_val = 1 if listing["rooms"].lower() == "studio" else int(listing["rooms"])
-       try:
-           if rooms_val < int(MIN_ROOMS):
-               return False
-       except ValueError:
-           pass
-   if CITIES and listing["city"]:
-       if listing["city"].lower() not in CITIES:
-           return False
-   return True
+
+    if MAX_RENT and listing["price"]:
+
+        try:
+
+            if float(listing["price"]) > float(MAX_RENT):
+
+                return False
+
+        except ValueError:
+
+            pass
+
+    if MIN_SURFACE and listing["surface"]:
+
+        try:
+
+            surf = float(listing["surface"].replace(",", "."))
+
+            if surf < float(MIN_SURFACE):
+
+                return False
+
+        except ValueError:
+
+            pass
+
+    if MIN_ROOMS and listing["rooms"]:
+
+        rooms_val = 1 if listing["rooms"].lower() == "studio" else int(listing["rooms"])
+
+        try:
+
+            if rooms_val < int(MIN_ROOMS):
+
+                return False
+
+        except ValueError:
+
+            pass
+
+    if CITIES and listing["city"]:
+
+        if listing["city"].lower() not in CITIES:
+
+            return False
+
+    return True
+
 
 def load_state():
-   """Retourne (seen_refs: set, initialized: bool, last_heartbeat: str|None)."""
-   if not STATE_FILE.exists():
-       return set(), False, None
-   data = json.loads(STATE_FILE.read_text())
-   if isinstance(data, list):
-       return set(data), True, None
-   return (
-       set(data.get("seen_refs", [])),
-       bool(data.get("initialized", False)),
-       data.get("last_heartbeat"),
-   )
+
+    """Retourne (seen_refs: set, initialized: bool, last_heartbeat: str|None)."""
+
+    if not STATE_FILE.exists():
+
+        return set(), False, None
+
+    data = json.loads(STATE_FILE.read_text())
+
+    if isinstance(data, list):
+
+        return set(data), True, None
+
+    return (
+
+        set(data.get("seen_refs", [])),
+
+        bool(data.get("initialized", False)),
+
+        data.get("last_heartbeat"),
+
+    )
+
 
 def save_state(refs: set, initialized: bool = True, last_heartbeat: str = None):
-   STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-   STATE_FILE.write_text(
-       json.dumps(
-           {
-               "initialized": initialized,
-               "seen_refs": sorted(refs),
-               "last_heartbeat": last_heartbeat,
-           },
-           ensure_ascii=False,
-           indent=2,
-       )
-   )
+
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    STATE_FILE.write_text(
+
+        json.dumps(
+
+            {
+
+                "initialized": initialized,
+
+                "seen_refs": sorted(refs),
+
+                "last_heartbeat": last_heartbeat,
+
+            },
+
+            ensure_ascii=False,
+
+            indent=2,
+
+        )
+
+    )
+
 
 def send_telegram(message: str):
-   if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-       print("⚠️  Telegram non configuré, message non envoyé:\n", message)
-       return
-   url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-   resp = requests.post(
-       url,
-       data={
-           "chat_id": TELEGRAM_CHAT_ID,
-           "text": message,
-           "disable_web_page_preview": False,
-       },
-       timeout=15,
-   )
-   if not resp.ok:
-       print("Erreur envoi Telegram:", resp.status_code, resp.text, file=sys.stderr)
+
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+
+        print("⚠️  Telegram non configuré, message non envoyé:\n", message)
+
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    resp = requests.post(
+
+        url,
+
+        data={
+
+            "chat_id": TELEGRAM_CHAT_ID,
+
+            "text": message,
+
+            "disable_web_page_preview": False,
+
+        },
+
+        timeout=15,
+
+    )
+
+    if not resp.ok:
+
+        print("Erreur envoi Telegram:", resp.status_code, resp.text, file=sys.stderr)
+
 
 def main():
-   seen_refs, initialized, last_heartbeat = load_state()
-   is_first_run = not initialized
-   all_listings = []
-   for page in range(1, MAX_PAGES + 1):
-       try:
-           html = fetch_page(page)
-       except requests.RequestException as e:
-           print(f"Erreur réseau page {page}: {e}", file=sys.stderr)
-           break
-       listings = parse_listings(html)
-       if not listings:
-           break
-       all_listings.extend(listings)
-       time.sleep(1)
-   current_refs = {l["ref"] for l in all_listings}
-   new_refs = current_refs - seen_refs
-   if is_first_run:
-       print(f"Premier lancement : {len(current_refs)} annonce(s) enregistrée(s) comme référence, aucune notif envoyée.")
-   else:
-       new_listings = [l for l in all_listings if l["ref"] in new_refs]
-       matching = [l for l in new_listings if matches_criteria(l)]
-       print(f"{len(current_refs)} annonce(s) actuellement en ligne sous ce filtre.")
-       print(f"{len(new_listings)} nouvelle(s) annonce(s) au total, {len(matching)} correspondant à tes critères.")
-       for listing in matching:
-           msg = (
-               f"🏠 Nouvelle annonce in'li\n"
-               f"{listing['city'] or ''}\n"
-               f"{listing['rooms'] or '?'} pièce(s) · {listing['surface'] or '?'} m² · {listing['price'] or '?'} €\n"
-               f"{listing['url']}"
-           )
-           send_telegram(msg)
-   # ---------- Heartbeat horaire (9h-20h, heure de Paris) ----------
-   now_paris = datetime.now(PARIS_TZ)
-   heartbeat_key = now_paris.strftime("%Y-%m-%d-%H")
-   should_send_heartbeat = (
-       not is_first_run
-       and HEARTBEAT_START_HOUR <= now_paris.hour <= HEARTBEAT_END_HOUR
-       and heartbeat_key != last_heartbeat
-   )
-   if should_send_heartbeat:
-       send_telegram(
-           f"✅ Système actif — {now_paris.strftime('%H:%M')} — "
-           f"{len(current_refs)} annonce(s) en ligne actuellement sous ton filtre."
-       )
-       last_heartbeat = heartbeat_key
-       print(f"Heartbeat envoyé pour {heartbeat_key}.")
-   save_state(current_refs, initialized=True, last_heartbeat=last_heartbeat)
+
+    seen_refs, initialized, last_heartbeat = load_state()
+
+    is_first_run = not initialized
+
+    all_listings = []
+
+    for page in range(1, MAX_PAGES + 1):
+
+        try:
+
+            html = fetch_page(page)
+
+        except requests.RequestException as e:
+
+            print(f"Erreur réseau page {page}: {e}", file=sys.stderr)
+
+            break
+
+        listings = parse_listings(html)
+
+        if not listings:
+
+            break
+
+        all_listings.extend(listings)
+
+        time.sleep(1)
+
+    current_refs = {l["ref"] for l in all_listings}
+
+    new_refs = current_refs - seen_refs
+
+    if is_first_run:
+
+        print(f"Premier lancement : {len(current_refs)} annonce(s) enregistrée(s) comme référence, aucune notif envoyée.")
+
+    else:
+
+        new_listings = [l for l in all_listings if l["ref"] in new_refs]
+
+        matching = [l for l in new_listings if matches_criteria(l)]
+
+        print(f"{len(current_refs)} annonce(s) actuellement en ligne sous ce filtre.")
+
+        print(f"{len(new_listings)} nouvelle(s) annonce(s) au total, {len(matching)} correspondant à tes critères.")
+
+        for listing in matching:
+
+            msg = (
+
+                f"🏠 Nouvelle annonce in'li\n"
+
+                f"{listing['city'] or ''}\n"
+
+                f"{listing['rooms'] or '?'} pièce(s) · {listing['surface'] or '?'} m² · {listing['price'] or '?'} €\n"
+
+                f"{listing['url']}"
+
+            )
+
+            send_telegram(msg)
+
+    # ---------- Heartbeat horaire (9h-20h, heure de Paris) ----------
+
+    now_paris = datetime.now(PARIS_TZ)
+
+    heartbeat_key = now_paris.strftime("%Y-%m-%d-%H")
+
+    should_send_heartbeat = (
+
+        not is_first_run
+
+        and HEARTBEAT_START_HOUR <= now_paris.hour <= HEARTBEAT_END_HOUR
+
+        and heartbeat_key != last_heartbeat
+
+    )
+
+    if should_send_heartbeat:
+
+        send_telegram(
+
+            f"✅ Système actif — {now_paris.strftime('%H:%M')} — "
+
+            f"{len(current_refs)} annonce(s) en ligne actuellement sous ton filtre."
+
+        )
+
+        last_heartbeat = heartbeat_key
+
+        print(f"Heartbeat envoyé pour {heartbeat_key}.")
+
+    save_state(current_refs, initialized=True, last_heartbeat=last_heartbeat)
+
 
 if __name__ == "__main__":
-   main()
+
+    main()
