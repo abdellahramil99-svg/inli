@@ -1,5 +1,11 @@
 {
-  "initialized": false,
-  "seen_refs": [],
+  "initialized": true,
+  "seen_refs": [
+    "654-20081-10010",
+    "PRV-318104",
+    "PRV-320905",
+    "PRV-381830",
+    "x3F-4078-1216L"
+  ],
   "last_heartbeat": null
 }
