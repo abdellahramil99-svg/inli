@@ -1,11 +1,5 @@
 {
   "initialized": true,
-  "seen_refs": [
-    "PRV-306321",
-    "PRV-318104",
-    "PRV-327079",
-    "PRV-377848",
-    "PRV-385527"
-  ],
+  "seen_refs": [],
   "last_heartbeat": "2026-09-11-20"
 }
