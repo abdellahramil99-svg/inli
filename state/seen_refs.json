@@ -1,5 +1,8 @@
 {
   "initialized": true,
-  "seen_refs": [],
-  "last_heartbeat": "2026-10-15-12"
+  "seen_refs": [
+    "PRV-250042",
+    "PRV-320921"
+  ],
+  "last_heartbeat": "2026-10-15-17"
 }
