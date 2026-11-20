@@ -2,7 +2,9 @@
   "initialized": true,
   "seen_refs": [
     "PRV-062895",
-    "PRV-315325"
+    "PRV-315325",
+    "x3F-4078-0206L",
+    "x3F-4078-1104L"
   ],
   "last_heartbeat": "2026-11-20-17"
 }
